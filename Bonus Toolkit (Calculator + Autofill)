@@ -1,0 +1,693 @@
+// ==UserScript==
+// @name         Bonus Toolkit (Calculator + Autofill)
+// @namespace    https://tampermonkey.net/
+// @version      1.3
+// @description  Bonus eligibility calculator + Personal Bonus / Freespins popup autofill, combined into one script
+// @match        *://*/backend/*
+// @grant        none
+// ==/UserScript==
+(function () {
+    'use strict';
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SHARED STATE
+    // ════════════════════════════════════════════════════════════════════════
+
+    let lastCalcResult = null;
+
+    function getCurrentPlayerId() {
+        return (location.pathname.match(/\/players\/(\d+)/) || [])[1] || null;
+    }
+
+    function getStoredRewardAmount(rewardType) {
+        if (!lastCalcResult) return null;
+        if (lastCalcResult.rewardType !== rewardType) return null;
+
+        const playerId = getCurrentPlayerId();
+        if (playerId && lastCalcResult.playerId && playerId !== lastCalcResult.playerId) return null;
+
+        return lastCalcResult.rewardAmount || null;
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SECTION 1 — BONUS CALCULATOR
+    // ════════════════════════════════════════════════════════════════════════
+
+    const BLOCKING_TAGS = ['BA', 'Only VIP manager cashback'];
+
+    const CRYPTO_MAP = {
+        'BTC': 'bitcoin',
+        'ETH': 'ethereum',
+        'USDT': 'tether',
+        'LTC': 'litecoin',
+        'SOL': 'solana',
+        'USDC': 'usd-coin',
+        'TON': 'the-open-network',
+        'TRX': 'tron',
+        'XRP': 'ripple',
+        'BNB': 'binancecoin',
+        'DOGE': 'dogecoin',
+        'DOG': 'dogecoin',
+        'BCH': 'bitcoin-cash',
+        'ADA': 'cardano'
+    };
+
+    function isCryptoCurrency(currency) {
+        return Object.prototype.hasOwnProperty.call(CRYPTO_MAP, (currency || '').toUpperCase());
+    }
+
+    async function fetchUsdRate(currency) {
+        const coinId = CRYPTO_MAP[(currency || '').toUpperCase()];
+        if (!coinId) return null;
+
+        try {
+            const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`);
+            const data = await res.json();
+            return data?.[coinId]?.usd || null;
+        } catch (e) {
+            console.error('Bonus Calc: failed to fetch USD rate for', currency, e);
+            return null;
+        }
+    }
+
+    // ─── BUTTON ──────────────────────────────────────────────────────────────
+
+    function addCalculatorButton() {
+        // Only show on player profile pages (/players/<id>).
+        // Remove the button if we navigate away from a player page.
+        if (!getCurrentPlayerId()) {
+            const existing = document.getElementById('tm-bonus-calc');
+            if (existing) existing.remove();
+            return;
+        }
+
+        if (document.getElementById('tm-bonus-calc')) return;
+
+        injectCalculatorStyles();
+
+        const btn = document.createElement('button');
+        btn.id = 'tm-bonus-calc';
+        btn.className = 'button-14';
+        btn.textContent = '🎁 Bonus Calc';
+        btn.style.cssText = `
+            position: fixed;
+            top: 120px;
+            right: 20px;
+            z-index: 99999;
+        `;
+        btn.addEventListener('click', () => runCalculator(btn));
+        document.body.appendChild(btn);
+    }
+
+    function injectCalculatorStyles() {
+        if (document.getElementById('tm-bonus-calc-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'tm-bonus-calc-styles';
+        style.textContent = `
+            .button-14 {
+              background-image: linear-gradient(#f7f8fa ,#e7e9ec);
+              border-color: #adb1b8 #a2a6ac #8d9096;
+              border-style: solid;
+              border-width: 1px;
+              border-radius: 3px;
+              box-shadow: rgba(255,255,255,.6) 0 1px 0 inset;
+              box-sizing: border-box;
+              color: #0f1111;
+              cursor: pointer;
+              display: inline-block;
+              font-family: "Amazon Ember",Arial,sans-serif;
+              font-size: 14px;
+              height: 29px;
+              font-size: 13px;
+              outline: 0;
+              overflow: hidden;
+              padding: 0 11px;
+              text-align: center;
+              text-decoration: none;
+              text-overflow: ellipsis;
+              user-select: none;
+              -webkit-user-select: none;
+              touch-action: manipulation;
+              white-space: nowrap;
+            }
+            .button-14:active {
+              border-bottom-color: #a2a6ac;
+            }
+            .button-14:active:hover {
+              border-bottom-color: #a2a6ac;
+            }
+            .button-14:hover {
+              border-color: #a2a6ac #979aa1 #82858a;
+            }
+            .button-14:focus {
+              border-color: #e77600;
+              box-shadow: rgba(228, 121, 17, .5) 0 0 3px 2px;
+              outline: 0;
+            }
+
+            #tm-bonus-result-overlay {
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.35);
+                z-index: 999999;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: auto;
+            }
+            #tm-bonus-result-box {
+                background: #fff;
+                border-radius: 8px;
+                max-width: 600px;
+                width: 90%;
+                max-height: 80vh;
+                overflow-y: auto;
+                padding: 20px 24px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                font-family: "Amazon Ember", Arial, sans-serif;
+                font-size: 14px;
+                color: #0f1111;
+                white-space: pre-wrap;
+                position: relative;
+            }
+            #tm-bonus-result-close {
+                position: absolute;
+                top: 10px;
+                right: 14px;
+                cursor: pointer;
+                font-size: 18px;
+                line-height: 1;
+                color: #555;
+                background: none;
+                border: none;
+            }
+            #tm-bonus-result-close:hover {
+                color: #000;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── DATE HELPERS ─────────────────────────────────────────────────────────
+
+    function parseLocalDate(str) {
+        const [datePart, timePart] = str.trim().split(' ');
+        const [y, mo, d] = datePart.split('-').map(Number);
+        const [h, mi, s] = (timePart || '00:00:00').split(':').map(Number);
+        return new Date(y, mo - 1, d, h, mi, s).getTime();
+    }
+
+    function formatDate(str) {
+        return str.trim().slice(0, 19);
+    }
+
+    // ─── MAIN FLOW ───────────────────────────────────────────────────────────
+
+    async function runCalculator(btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Checking…';
+
+        try {
+            const tags = getPlayerTags();
+            const blockingTags = BLOCKING_TAGS.filter(t => tags.includes(t));
+
+            if (blockingTags.length) {
+                return showResult(
+                    `⛔ CALCULATION BLOCKED\n\n` +
+                    `Player has restricted tag(s): ${blockingTags.join(', ')}\n\n` +
+                    `Bonus eligibility was not calculated. Manager approval required.`
+                );
+            }
+
+            const account = getAccountStats();
+            if (!account) {
+                return showResult('❌ Could not read account statistics.\nMake sure you are on a player page.');
+            }
+
+            let usdRate = null;
+            if (isCryptoCurrency(account.currency)) {
+                btn.textContent = '⏳ Fetching rate…';
+                usdRate = await fetchUsdRate(account.currency);
+                if (!usdRate) {
+                    return showResult(
+                        `❌ Could not fetch a USD rate for ${account.currency}.\n` +
+                        `Try again in a moment — CoinGecko may be rate-limiting or unreachable.`
+                    );
+                }
+            }
+
+            const balanceUsd = usdRate ? account.balance * usdRate : account.balance;
+
+            const failures = [];
+            if (balanceUsd >= 1) {
+                failures.push(
+                    usdRate
+                        ? `Balance: ${account.balance} ${account.currency} (≈ ${balanceUsd.toFixed(2)} USD) (must be < 1 USD equivalent)`
+                        : `Balance: ${account.balance} (must be < 1)`
+                );
+            }
+            if (account.pending > 0)         failures.push(`Pending cashouts: ${account.pending} (must be 0)`);
+            if (!account.spentGreen || account.spent <= 0)
+                                             failures.push(`Spent in casino: ${account.spent} ${account.spentGreen ? '' : '(not green)'} (must be > 0 and green)`);
+            if (account.bonusRatio >= 50)    failures.push(`Bonus ratio: ${account.bonusRatio}% (must be < 50%)`);
+
+            if (failures.length) {
+                return showResult('❌ Not eligible – basic requirements failed:\n\n• ' + failures.join('\n• '));
+            }
+
+            btn.textContent = '⏳ Loading payments…';
+            const expandResult = await expandPaymentsPerPage();
+
+            const expandWarning = (!expandResult.expanded && expandResult.reason === 'timeout')
+                ? `\n\n⚠️ WARNING: Payments table may not have fully expanded to 100/page ` +
+                  `(timed out waiting). This player may have a large payment history — ` +
+                  `results below could be based on an incomplete list. Try running the ` +
+                  `calculator again, or manually set "100" per page on the Payments table first.`
+                : '';
+
+            const lastBonus = getLastQualifyingBonusDate();
+            if (!lastBonus) {
+                return showResult('❌ No Personal, Deposit, or Loyalty FS Bgaming bonus found in Issued Bonuses / Issued Freespins.');
+            }
+
+            const payments = getPaymentRows();
+
+            const startInfo = getStartAfterCashout(payments, lastBonus.ts);
+
+            const deposits = payments.filter(p =>
+                p.action === 'Deposit' &&
+                p.success &&
+                p.ts > startInfo.ts
+            );
+
+            const total = deposits.reduce((sum, p) => sum + p.amount, 0);
+
+            const totalUsd = usdRate ? total * usdRate : total;
+
+            if (deposits.length === 0 || total <= 0) {
+                let msg = '❌ Not eligible\n\n';
+                msg += `Last qualifying bonus (${lastBonus.kind}): ${formatDate(lastBonus.str)}\n`;
+                if (startInfo.ts > lastBonus.ts) {
+                    msg += `Latest cashout after bonus: ${formatDate(startInfo.str)}\n`;
+                }
+                msg += 'No successful deposits found after that date.';
+                if (usdRate) {
+                    msg += `\n\n(Rate used: 1 ${account.currency} ≈ ${usdRate} USD)`;
+                }
+                msg += expandWarning;
+                return showResult(msg);
+            }
+
+            const roundUp5 = n => Math.ceil(n / 5) * 5;
+            let rewardAmount;
+            let rewardAmountUsd;
+            let rewardLabel;
+            let rewardKind;
+            if (totalUsd < 100) {
+                rewardKind = 'freespins';
+                rewardAmountUsd = roundUp5(Math.ceil(totalUsd / 2));
+                rewardAmount = rewardAmountUsd;
+                rewardLabel  = `${rewardAmount} Free Spins`;
+                if (usdRate) {
+                    rewardLabel += ` (based on ≈ ${totalUsd.toFixed(2)} USD of deposits)`;
+                }
+            } else {
+                rewardKind = 'bonus';
+                rewardAmountUsd = roundUp5(Math.ceil(totalUsd * 0.10));
+                rewardAmount = usdRate ? rewardAmountUsd / usdRate : rewardAmountUsd;
+                rewardLabel  = usdRate
+                    ? `${rewardAmount.toFixed(8).replace(/0+$/, '').replace(/\.$/, '')} ${account.currency} (≈ ${rewardAmountUsd} USD) Bonus`
+                    : `${rewardAmount} ${account.currency} Bonus`;
+            }
+
+            const escalate = rewardAmountUsd > 200;
+
+            lastCalcResult = {
+                playerId: getCurrentPlayerId(),
+                currency: account.currency,
+                rewardAmount,
+                rewardType: rewardKind,
+                calculatedAt: Date.now()
+            };
+
+            const fmtNative = n => usdRate ? n.toFixed(8).replace(/0+$/, '').replace(/\.$/, '') : n.toFixed(2);
+            const depositLines = deposits.map(d =>
+                usdRate
+                    ? `  ${formatDate(d.str)}  +${fmtNative(d.amount)} ${account.currency} (≈ ${(d.amount * usdRate).toFixed(2)} USD)`
+                    : `  ${formatDate(d.str)}  +${d.amount} ${account.currency}`
+            ).join('\n');
+
+            let msg = `✅ ELIGIBLE\n\n`;
+
+            msg += `Basic checks:\n`;
+            msg += usdRate
+                ? `  ✔ Balance: ${account.balance} ${account.currency} (≈ ${balanceUsd.toFixed(2)} USD) (< 1 USD equivalent)\n`
+                : `  ✔ Balance: ${account.balance} (< 1)\n`;
+            msg += `  ✔ Pending cashouts: ${account.pending} (= 0)\n`;
+            msg += `  ✔ Spent in casino: ${account.spent} (green)\n`;
+            msg += `  ✔ Bonus ratio: ${account.bonusRatio}% (< 50%)\n\n`;
+            msg += `Last qualifying bonus (${lastBonus.kind}): ${formatDate(lastBonus.str)}\n`;
+            msg += (startInfo.ts > lastBonus.ts
+                ? `Deposits counted from after cashout: ${formatDate(startInfo.str)}\n`
+                : `Deposits counted from after bonus date\n`);
+            msg += `\nDeposits considered:\n${depositLines}\n\n`;
+            msg += usdRate
+                ? `Total deposited: ${fmtNative(total)} ${account.currency} (≈ ${totalUsd.toFixed(2)} USD @ rate ${usdRate})\n\n`
+                : `Total deposited: ${total.toFixed(2)} ${account.currency}\n\n`;
+            msg += `🎁 Reward: ${rewardLabel}`;
+
+            if (escalate) {
+                msg += `\n\n🔺 ESCALATE TO VIP – reward exceeds 200 USD equivalent`;
+            }
+
+            msg += expandWarning;
+
+            showResult(msg);
+
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '🎁 Bonus Calc';
+        }
+    }
+
+    // ─── PLAYER TAGS ─────────────────────────────────────────────────────────
+
+    function getPlayerTags() {
+        const el = document.getElementById('user_tags');
+        if (!el) return [];
+        try {
+            return JSON.parse(el.dataset.tags || '[]');
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // ─── ACCOUNT STATISTICS ──────────────────────────────────────────────────
+
+    function getAccountStats() {
+        const row = document.querySelector('.account_statistics tbody tr:has(.status_tag.yes)');
+        if (!row) return null;
+
+        const balance = parseFloat(
+            row.querySelector('.col-balance')?.innerText.replace(/[^\d.]/g, '')
+        ) || 0;
+
+        const pending = parseFloat(
+            row.querySelector('.col-pending_cashouts_sum')?.innerText.replace(/[^\d.]/g, '')
+        ) || 0;
+
+        const spentCell = row.querySelector('.col-spent_in_casino');
+        const spent = parseFloat(spentCell?.innerText.replace(/[^\d.]/g, '')) || 0;
+        const spentGreen = !!spentCell?.querySelector('.green');
+
+        const bonusRatio = parseFloat(
+            row.querySelector('.col-bonus_ratio')?.innerText.replace('%', '')
+        ) || 0;
+
+        const currency = row.querySelector('.col-currency .status_tag.yes')?.innerText.trim() || '';
+
+        return { balance, pending, spent, spentGreen, bonusRatio, currency };
+    }
+
+    // ─── LATEST QUALIFYING BONUS ──────────────────────────────────────────────
+
+    function getLastQualifyingBonusDate() {
+        let latest = null;
+
+        const consider = (str, ts, kind) => {
+            if (!latest || ts > latest.ts) latest = { str, ts, kind };
+        };
+
+        document.querySelectorAll('#js-player-bonus-issues-table tbody tr').forEach(row => {
+            const strategy = row.querySelector('.col-strategy')?.innerText.trim();
+            if (strategy !== 'Personal' && strategy !== 'Deposit') return;
+
+            const str = row.querySelector('.col-issued_at')?.innerText.trim();
+            if (!str) return;
+
+            consider(str, parseLocalDate(str), strategy);
+        });
+
+        document.querySelectorAll('#js-player-freespin-issues-table tbody tr').forEach(row => {
+            const strategy = row.querySelector('.col-strategy')?.innerText.trim();
+            const bonusName = row.querySelector('.col-freespin_bonus')?.innerText.trim() || '';
+            const isLoyaltyFS = bonusName.includes('Loyalty FS Bgaming');
+
+            let kind = null;
+            if (strategy === 'Personal' || strategy === 'Deposit') {
+                kind = strategy;
+            } else if (isLoyaltyFS) {
+                kind = 'Loyalty FS Bgaming';
+            }
+            if (!kind) return;
+
+            const str = row.querySelector('.col-issued_at')?.innerText.trim();
+            if (!str) return;
+
+            consider(str, parseLocalDate(str), kind);
+        });
+
+        return latest;
+    }
+
+    // ─── EXPAND PAYMENTS TO 100/PAGE ─────────────────────────────────────────
+
+    function expandPaymentsPerPage() {
+        const links = document.querySelectorAll('a[href*="toggle_payments?payments_per_page=100"]');
+        if (!links.length) {
+            return Promise.resolve({ expanded: true, reason: 'no_control' });
+        }
+
+        const before = document.querySelectorAll('#js-player-payments-table tbody tr').length;
+
+        // The default page size is 10. If fewer than 10 rows are showing,
+        // the player has fewer than 10 total payments and everything is
+        // already visible — no need to click expand.
+        if (before < 10) {
+            return Promise.resolve({ expanded: true, reason: 'already_complete' });
+        }
+
+        links[0].click();
+
+        return new Promise(resolve => {
+            let tries = 0;
+            const maxTries = 150; // 150 * 200ms = 30 seconds
+            const interval = setInterval(() => {
+                const table = document.getElementById('js-player-payments-table');
+                const after = table ? table.querySelectorAll('tbody tr').length : 0;
+                tries++;
+
+                if (after > before) {
+                    clearInterval(interval);
+                    resolve({ expanded: true, reason: 'grew', rows: after });
+                    return;
+                }
+
+                if (tries > maxTries) {
+                    clearInterval(interval);
+                    resolve({ expanded: false, reason: 'timeout', rows: after });
+                }
+            }, 200);
+        });
+    }
+
+    // ─── READ PAYMENT ROWS ───────────────────────────────────────────────────
+
+    function getPaymentRows() {
+        const rows = document.querySelectorAll('#js-player-payments-table tbody tr');
+        const results = [];
+
+        rows.forEach(row => {
+            const actionCell = row.querySelector('.col-action a');
+            if (!actionCell) return;
+
+            const action = actionCell.innerText.trim();
+            const successSpan = row.querySelector('.col-success .status_tag');
+            const success = successSpan?.innerText.trim().toLowerCase() === 'yes';
+
+            const str = row.querySelector('.col-created_at')?.innerText.trim();
+            if (!str) return;
+            const ts = parseLocalDate(str);
+
+            const amountText = row.querySelector('.col-amount')?.innerText.trim() || '0';
+            const amount = parseFloat(amountText.replace(/[^\d.]/g, '')) || 0;
+
+            results.push({ action, success, str, ts, amount });
+        });
+
+        return results;
+    }
+
+    // ─── START DATE: after latest successful cashout post-bonus ──────────────
+
+    function getStartAfterCashout(payments, bonusTs) {
+        let latest = null;
+
+        payments.forEach(p => {
+            if (p.action === 'Cashout' && p.success && p.ts > bonusTs) {
+                if (!latest || p.ts > latest.ts) latest = { str: p.str, ts: p.ts };
+            }
+        });
+
+        return latest || { str: '', ts: bonusTs };
+    }
+
+    // ─── DISPLAY ─────────────────────────────────────────────────────────────
+
+    function showResult(message) {
+        const existing = document.getElementById('tm-bonus-result-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'tm-bonus-result-overlay';
+
+        const box = document.createElement('div');
+        box.id = 'tm-bonus-result-box';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.id = 'tm-bonus-result-close';
+        closeBtn.textContent = '✕';
+        closeBtn.addEventListener('click', () => overlay.remove());
+
+        const text = document.createElement('div');
+        text.textContent = message;
+
+        box.appendChild(closeBtn);
+        box.appendChild(text);
+        overlay.appendChild(box);
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) overlay.remove();
+        });
+
+        document.body.appendChild(overlay);
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SECTION 2 — PERSONAL BONUS POPUP AUTOFILL
+    // ════════════════════════════════════════════════════════════════════════
+
+    function autofillPersonalBonus() {
+        const bonus = document.getElementById('bonus_issue_bonus');
+        if (bonus && !bonus.value) {
+            bonus.value = 'Personal Bonus';
+            bonus.dispatchEvent(new Event('input', { bubbles: true }));
+            bonus.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        const activeCurrency = document.querySelector('td.col-currency a.status_tag.yes');
+        const currencySelect = document.getElementById('bonus_issue_currency');
+        if (activeCurrency && currencySelect && !currencySelect.value) {
+            const currency = activeCurrency.textContent.trim();
+            if ([...currencySelect.options].some(option => option.value === currency)) {
+                currencySelect.value = currency;
+                currencySelect.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+
+        const wager = document.getElementById('bonus_issue_wager_multiplier');
+        if (wager && !wager.value) {
+            wager.value = '40';
+            wager.dispatchEvent(new Event('input', { bubbles: true }));
+            wager.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        const validUntil = document.getElementById('bonus_issue_valid_until');
+        if (validUntil && !validUntil.value) {
+            const date = new Date();
+            date.setDate(date.getDate() + 7);
+            const formattedDate = date.toISOString().split('T')[0];
+            validUntil.value = formattedDate;
+            validUntil.dispatchEvent(new Event('input', { bubbles: true }));
+            validUntil.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        const amount = document.getElementById('bonus_issue_amount');
+        if (amount && !amount.dataset.focused) {
+            if (!amount.value) {
+                const storedAmount = getStoredRewardAmount('bonus');
+                if (storedAmount) {
+                    amount.value = storedAmount;
+                    amount.dispatchEvent(new Event('input', { bubbles: true }));
+                    amount.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+            amount.focus();
+            amount.dataset.focused = '1';
+        }
+
+        const comment = document.getElementById('bonus_issue_comment');
+        if (comment && !comment.value) {
+            comment.value = 'losses';
+            comment.dispatchEvent(new Event('input', { bubbles: true }));
+            comment.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SECTION 3 — FREESPINS POPUP AUTOFILL
+    // ════════════════════════════════════════════════════════════════════════
+
+    function getActiveCurrencyForFreespins(form) {
+        const activeCurrency = document.querySelector('td.col-currency a.status_tag.yes');
+        if (activeCurrency) return activeCurrency.textContent.trim();
+
+        if (form && form.dataset.playerProfileCurrency) {
+            return form.dataset.playerProfileCurrency.trim();
+        }
+        return null;
+    }
+
+    function autofillFreespins() {
+        const form = document.getElementById('js_issue_freespins_form');
+        if (!form) return;
+
+        const bonusSelect = document.getElementById('freespin_issue_freespin_bonus_id');
+        if (bonusSelect && !bonusSelect.value) {
+            const currency = getActiveCurrencyForFreespins(form);
+            if (currency) {
+                const target = `${currency} Loyalty FS Bgaming ${currency}`;
+                const option = [...bonusSelect.options].find(
+                    opt => opt.textContent.trim() === target
+                );
+                if (option) {
+                    bonusSelect.value = option.value;
+                    bonusSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+        }
+
+        const spinsCount = document.getElementById('freespin_issue_spins_count');
+        if (spinsCount && !spinsCount.value && !spinsCount.dataset.autofilled) {
+            const storedCount = getStoredRewardAmount('freespins');
+            if (storedCount) {
+                spinsCount.value = storedCount;
+                spinsCount.dispatchEvent(new Event('input', { bubbles: true }));
+                spinsCount.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            spinsCount.dataset.autofilled = '1';
+        }
+
+        const comment = document.getElementById('freespin_issue_comment');
+        if (comment && !comment.value) {
+            comment.value = 'ly';
+            comment.dispatchEvent(new Event('input', { bubbles: true }));
+            comment.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SINGLE TICK LOOP
+    // ════════════════════════════════════════════════════════════════════════
+
+    setInterval(() => {
+        addCalculatorButton();
+        autofillPersonalBonus();
+        autofillFreespins();
+    }, 300);
+
+})();
