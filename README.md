@@ -3,9 +3,9 @@
 A Tampermonkey userscript for the SOFTSWISS backoffice that automates bonus eligibility checking, reward calculation, and form autofill for Personal Bonuses and Freespins.
 
 
-# [!WARNING ]
+[!WARNING]
 This script is currently in active testing and should be used with caution.
-Results may not always be accurate. Always review the calculated reward before issuing a bonus — do not issue anything solely based on the script's output without a manual sanity check
+Results may not always be accurate. Always review the calculated reward before issuing a bonus.
 
 ---
 
