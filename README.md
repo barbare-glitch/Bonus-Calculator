@@ -1,4 +1,4 @@
-# 🎁 SOFTSWISS Bonus Toolkit
+# 🎁 Bonus Toolkit
 
 A Tampermonkey userscript for the SOFTSWISS backoffice that automates bonus eligibility checking, reward calculation, and form autofill for Personal Bonuses and Freespins.
 
