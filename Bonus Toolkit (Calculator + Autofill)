@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bonus Toolkit (Calculator + Autofill)
 // @namespace    https://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Bonus eligibility calculator + Personal Bonus / Freespins popup autofill, combined into one script
 // @match        *://*/backend/*
 // @grant        none
@@ -56,6 +56,18 @@
             console.error('Bonus Calc: failed to fetch USD rate for', currency, e);
             return null;
         }
+    }
+
+    // Rounds a crypto amount to 8 decimal places (satoshi-level precision —
+    // plenty for every coin we deal with) and returns it as a NUMBER, not a
+    // string. This must happen exactly once, right where rewardAmount is
+    // computed, so every downstream consumer (the result panel AND the
+    // autofill scripts) works from the same clean value. Doing the rounding
+    // only at display time (e.g. via toFixed in the template) leaves the
+    // underlying stored number full of floating-point noise, which is what
+    // was leaking into the Personal Bonus popup's amount field.
+    function roundCrypto(amount) {
+        return Math.round(amount * 1e8) / 1e8;
     }
 
     // ─── STYLES ──────────────────────────────────────────────────────────────
@@ -445,13 +457,18 @@
             if (totalUsd < 100) {
                 rewardKind = 'freespins';
                 rewardAmountUsd = roundUp5(Math.ceil(totalUsd / 2));
-                rewardAmount = rewardAmountUsd;
+                rewardAmount = rewardAmountUsd; // plain spin count, never crypto-denominated
                 rewardLabel = `${rewardAmount} free spins`;
             } else {
                 rewardKind = 'bonus';
                 rewardAmountUsd = roundUp5(Math.ceil(totalUsd * 0.10));
-                rewardAmount = usdRate ? rewardAmountUsd / usdRate : rewardAmountUsd;
-                const nativeFmt = rewardAmount.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+                // Round here, once, at the source — this is the exact value
+                // that gets stored AND displayed, so there's no drift between
+                // what the panel shows and what the popup autofills.
+                rewardAmount = usdRate ? roundCrypto(rewardAmountUsd / usdRate) : rewardAmountUsd;
+                const nativeFmt = usdRate
+                    ? rewardAmount.toFixed(8).replace(/0+$/, '').replace(/\.$/, '')
+                    : String(rewardAmount);
                 rewardLabel = usdRate
                     ? `${nativeFmt} ${account.currency} (≈ ${rewardAmountUsd} USD)`
                     : `${rewardAmount} ${account.currency}`;
@@ -803,7 +820,10 @@
             if (!amount.value) {
                 const storedAmount = getStoredRewardAmount('bonus');
                 if (storedAmount) {
-                    amount.value = storedAmount;
+                    // storedAmount is already rounded to 8 decimals at the
+                    // source (see roundCrypto) — format here only strips
+                    // trailing zeros for display, it does not re-round.
+                    amount.value = Number(storedAmount.toFixed(8));
                     amount.dispatchEvent(new Event('input', { bubbles: true }));
                     amount.dispatchEvent(new Event('change', { bubbles: true }));
                 }
